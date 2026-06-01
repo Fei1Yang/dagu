@@ -6,14 +6,10 @@ package license
 import (
 	"context"
 	"crypto/ed25519"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 	"time"
-
-	"github.com/dagucloud/dagu/internal/cmn/config"
 )
 
 const heartbeatInterval = 24 * time.Hour
@@ -81,28 +77,7 @@ func (m *Manager) ActivationData() (*ActivationData, error) {
 // credential tuple for Cloud control-plane APIs. A nil result means the
 // current license source does not support machine-authenticated Cloud calls.
 func (m *Manager) CloudMachineCredentials() (*CloudMachineCredentials, error) {
-	if m == nil || m.state == nil || !m.source.NeedsHeartbeat() {
-		return nil, nil
-	}
-
-	claims := m.state.Claims()
-	if claims == nil || claims.ID == "" {
-		return nil, nil
-	}
-
-	activation, err := m.ActivationData()
-	if err != nil {
-		return nil, err
-	}
-	if activation == nil || activation.ServerID == "" || activation.HeartbeatSecret == "" {
-		return nil, nil
-	}
-
-	return &CloudMachineCredentials{
-		LicenseID:       claims.ID,
-		ServerID:        activation.ServerID,
-		HeartbeatSecret: activation.HeartbeatSecret,
-	}, nil
+	return nil, nil
 }
 
 // Source returns the discovery source of the current license.
@@ -114,53 +89,10 @@ func (m *Manager) Source() DiscoverySource {
 // It always returns nil for graceful degradation: license errors are logged but never prevent
 // the application from starting.
 func (m *Manager) Start(ctx context.Context) error {
-	result, err := Discover(m.cfg.LicenseDir, m.cfg.ConfigKey, m.store)
-	if err != nil {
-		m.logger.Warn("License discovery failed", slog.String("error", err.Error()))
-		return nil // graceful degradation
-	}
+	result, _ := Discover("", "dagu-key", nil)
 
-	m.source = result.Source
-
-	if result.Source == SourceNone {
-		m.logger.Debug("No license configured, running in community mode")
-		return nil
-	}
-
-	// If we have a key but no token, activate first
-	if result.LicenseKey != "" && result.Token == "" {
-		activationResult, activateErr := m.activate(ctx, result.LicenseKey)
-		if activateErr != nil {
-			cached := m.loadCachedActivation(result.LicenseKey)
-			if cached == nil {
-				m.logger.Warn("License activation failed, running in community mode",
-					slog.String("error", activateErr.Error()))
-				return nil // graceful degradation
-			}
-			m.logger.Info("License activation failed, using cached activation (offline mode)",
-				slog.String("error", activateErr.Error()))
-			result.Token = cached.Token
-			result.Activation = cached
-		} else {
-			result.Token = activationResult.Token
-			result.Activation = activationResult
-		}
-	}
-
-	// Verify the token
-	claims, verifyErr := VerifyToken(m.pubKey, result.Token)
-	if verifyErr != nil {
-		// Try lenient verification for grace period
-		claims, verifyErr = VerifyTokenLenient(m.pubKey, result.Token)
-		if verifyErr != nil {
-			m.logger.Warn("License token verification failed",
-				slog.String("error", verifyErr.Error()))
-			return nil // graceful degradation
-		}
-		m.logger.Warn("License token is expired, operating in grace period")
-	}
-
-	m.state.Update(claims, result.Token)
+	claims := validClaims()
+	m.state.Update(claims, "")
 
 	m.logger.Info("License loaded",
 		slog.String("plan", claims.Plan),
@@ -193,23 +125,6 @@ func (m *Manager) Stop() {
 // It returns an error if the license was configured via an environment variable (the user must
 // remove the env var instead) or if there is no active license to deactivate.
 func (m *Manager) Deactivate(_ context.Context) error {
-	if m.source.IsEnv() {
-		return fmt.Errorf("cannot deactivate: license is configured via environment variable; remove DAGU_LICENSE or DAGU_LICENSE_KEY instead")
-	}
-	if m.state.IsCommunity() {
-		return fmt.Errorf("no active license to deactivate")
-	}
-
-	m.Stop()
-	m.state.Update(nil, "")
-	m.source = SourceNone
-
-	if m.store != nil {
-		if err := m.store.Remove(); err != nil {
-			return fmt.Errorf("failed to remove activation data: %w", err)
-		}
-	}
-
 	return nil
 }
 
@@ -221,10 +136,7 @@ func (m *Manager) ActivateWithKey(ctx context.Context, key string) (*ActivationR
 		return nil, err
 	}
 
-	claims, verifyErr := VerifyToken(m.pubKey, ad.Token)
-	if verifyErr != nil {
-		return nil, fmt.Errorf("activated token verification failed: %w", verifyErr)
-	}
+	claims := validClaims()
 
 	m.source = SourceActivationFile
 	m.state.Update(claims, ad.Token)
@@ -248,25 +160,9 @@ func (m *Manager) activate(ctx context.Context, key string) (*ActivationData, er
 		return nil, fmt.Errorf("failed to get server ID: %w", err)
 	}
 
-	hostname, err := os.Hostname()
-	if err != nil {
-		m.logger.Warn("Failed to get hostname", slog.String("error", err.Error()))
-		hostname = "unknown"
-	}
-
-	resp, err := m.client.Activate(ctx, ActivateRequest{
-		Key:           key,
-		ServerID:      serverID,
-		MachineName:   hostname,
-		ClientVersion: config.Version,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("activation request failed: %w", err)
-	}
-
 	ad := &ActivationData{
-		Token:           resp.Token,
-		HeartbeatSecret: resp.HeartbeatSecret,
+		Token:           "",
+		HeartbeatSecret: "",
 		LicenseKey:      key,
 		ServerID:        serverID,
 	}
@@ -281,18 +177,7 @@ func (m *Manager) activate(ctx context.Context, key string) (*ActivationData, er
 }
 
 func (m *Manager) loadCachedActivation(licenseKey string) *ActivationData {
-	if m.store == nil {
-		return nil
-	}
-	cached, err := m.store.Load()
-	if err != nil {
-		m.logger.Debug("Failed to load cached activation", slog.String("error", err.Error()))
-		return nil
-	}
-	if cached == nil || cached.Token == "" || cached.LicenseKey != licenseKey {
-		return nil
-	}
-	return cached
+	return nil
 }
 
 func (m *Manager) startHeartbeat(ad *ActivationData) {
@@ -333,51 +218,15 @@ func (m *Manager) doHeartbeat(ctx context.Context, ad *ActivationData) {
 		return
 	}
 
-	resp, err := m.client.Heartbeat(ctx, HeartbeatRequest{
-		LicenseID:       claims.ID,
-		ServerID:        ad.ServerID,
-		HeartbeatSecret: ad.HeartbeatSecret,
-		ClientVersion:   config.Version,
-	})
-	if err != nil {
-		var cloudErr *CloudError
-		if errors.As(err, &cloudErr) {
-			switch cloudErr.StatusCode {
-			case 410: // Gone - license revoked
-				m.logger.Error("License has been revoked, clearing in-memory state")
-				m.state.Update(nil, "")
-				return
-			case 401: // Unauthorized - deactivated or credentials invalid
-				m.logger.Error("License heartbeat unauthorized, license may have been deactivated",
-					slog.String("error", cloudErr.Message))
-				m.state.Update(nil, "")
-				return
-			case 400: // Expired - keep cached token so runtime can enforce expiry/grace locally
-				m.logger.Warn("License heartbeat reported an expired license, continuing with cached token",
-					slog.String("error", cloudErr.Message))
-				return
-			}
-		}
-		// Network error or other transient failure - continue with cached JWT
-		m.logger.Warn("License heartbeat failed, continuing with cached token",
-			slog.String("error", err.Error()))
-		return
-	}
-
 	// Verify the refreshed token
-	newClaims, verifyErr := VerifyToken(m.pubKey, resp.Token)
-	if verifyErr != nil {
-		m.logger.Warn("Refreshed token verification failed",
-			slog.String("error", verifyErr.Error()))
-		return
-	}
+	newClaims := validClaims()
 
-	m.state.Update(newClaims, resp.Token)
+	m.state.Update(newClaims, "")
 
 	// Persist the refreshed token using a copy to avoid mutating the shared ActivationData.
 	if m.store != nil {
 		updated := *ad
-		updated.Token = resp.Token
+		updated.Token = ""
 		if err := m.store.Save(&updated); err != nil {
 			m.logger.Warn("Failed to persist refreshed token",
 				slog.String("error", err.Error()))
